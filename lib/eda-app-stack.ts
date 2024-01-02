@@ -1,4 +1,7 @@
 import * as cdk from "aws-cdk-lib";
+import { Duration, RemovalPolicy } from "aws-cdk-lib";
+import { NodejsFunction } from "aws-cdk-lib/aws-lambda-nodejs";
+import { CfnOutput, Stack, StackProps } from "aws-cdk-lib";
 import * as lambdanode from "aws-cdk-lib/aws-lambda-nodejs";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as s3 from "aws-cdk-lib/aws-s3";
@@ -9,6 +12,7 @@ import * as sns from "aws-cdk-lib/aws-sns";
 import * as subs from "aws-cdk-lib/aws-sns-subscriptions";
 import * as iam from "aws-cdk-lib/aws-iam";
 import { Construct } from "constructs";
+import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
 
 export class EDAAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -19,6 +23,19 @@ export class EDAAppStack extends cdk.Stack {
       autoDeleteObjects: true,
       publicReadAccess: false,
     });
+
+    const badOrdersQueue = new sqs.Queue(this, "bad-orders-q", {
+        retentionPeriod: Duration.minutes(30),
+      });
+  
+      const ordersQueue = new sqs.Queue(this, "orders-queue", {
+        deadLetterQueue: {
+          queue: badOrdersQueue,
+          // # of rejections by consumer (lambda function)
+          maxReceiveCount: 2,
+        },
+      });
+  
 
 
     // Integration infrastructure
@@ -49,6 +66,34 @@ export class EDAAppStack extends cdk.Stack {
       }
     );
 
+    const processOrdersFn = new NodejsFunction(this, "ProcessOrdersFn", {
+        architecture: lambda.Architecture.ARM_64,
+        runtime: lambda.Runtime.NODEJS_16_X,
+        entry: `${__dirname}/../lambdas/processOrders.ts`,
+        timeout: Duration.seconds(10),
+        memorySize: 128,
+      });
+
+      // VVV For testing
+      const generateOrdersFn = new NodejsFunction(this, "GenerateOrdersFn", {
+        architecture: lambda.Architecture.ARM_64,
+        runtime: lambda.Runtime.NODEJS_16_X,
+        entry: `${__dirname}/../lambdas/generateOrders.ts`,
+        timeout: Duration.seconds(10),
+        memorySize: 128,
+        environment: {
+          QUEUE_URL: ordersQueue.queueUrl,
+        },
+      });
+
+      const failedOrdersFn = new NodejsFunction(this, "FailedOrdersFn", {
+        architecture: lambda.Architecture.ARM_64,
+        runtime: lambda.Runtime.NODEJS_16_X,
+        entry: `${__dirname}/../lambdas/handleBadOrder.ts`,
+        timeout: Duration.seconds(10),
+        memorySize: 128,
+      });
+
     const mailerFn = new lambdanode.NodejsFunction(this, "mailer-function", {
       runtime: lambda.Runtime.NODEJS_16_X,
       memorySize: 1024,
@@ -76,13 +121,27 @@ export class EDAAppStack extends cdk.Stack {
       maxBatchingWindow: cdk.Duration.seconds(10),
     });
 
+    processOrdersFn.addEventSource(
+        new SqsEventSource(ordersQueue, {
+          maxBatchingWindow: Duration.seconds(5),
+          maxConcurrency: 2,
+        })
+      );
+  
+      failedOrdersFn.addEventSource(
+        new SqsEventSource(badOrdersQueue, {
+          maxBatchingWindow: Duration.seconds(5),
+          maxConcurrency: 2,
+        })
+      );
+
     mailerFn.addEventSource(newImageMailEventSource);
 
     processImageFn.addEventSource(newImageEventSource);
 
-    // Permissions
-
     imagesBucket.grantRead(processImageFn);
+
+    ordersQueue.grantSendMessages(generateOrdersFn)
 
     mailerFn.addToRolePolicy(
       new iam.PolicyStatement({
@@ -102,16 +161,9 @@ export class EDAAppStack extends cdk.Stack {
       value: imagesBucket.bucketName,
     });
 
-    mailerFn.addToRolePolicy(
-        new iam.PolicyStatement({
-          effect: iam.Effect.ALLOW,
-          actions: [
-            "ses:SendEmail",
-            "ses:SendRawEmail",
-            "ses:SendTemplatedEmail",
-          ],
-          resources: ["*"],
-        })
-      );
+    new CfnOutput(this, "Generator Lambda name", {
+        value: generateOrdersFn.functionName,
+      });
+
   }
 }
