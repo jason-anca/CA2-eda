@@ -13,6 +13,7 @@ import * as subs from "aws-cdk-lib/aws-sns-subscriptions";
 import * as iam from "aws-cdk-lib/aws-iam";
 import { Construct } from "constructs";
 import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
+import { SqsDestination } from "aws-cdk-lib/aws-lambda-destinations";
 
 export class EDAAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -35,10 +36,18 @@ export class EDAAppStack extends cdk.Stack {
           maxReceiveCount: 2,
         },
       });
+
+      const edaTopic = new sns.Topic(this, "EDATopic", {
+        displayName: "EDA topic",
+      });
   
-
-
-    // Integration infrastructure
+      const queue = new sqs.Queue(this, "all-msg-queue", {
+        receiveMessageWaitTime: cdk.Duration.seconds(5),
+      });
+  
+      const failuresQueue = new sqs.Queue(this, "img-failure-queue", {
+        receiveMessageWaitTime: cdk.Duration.seconds(5),
+      });
 
     const imageProcessQueue = new sqs.Queue(this, "img-created-queue", {
       receiveMessageWaitTime: cdk.Duration.seconds(10),
@@ -74,6 +83,39 @@ export class EDAAppStack extends cdk.Stack {
         memorySize: 128,
       });
 
+      const processSNSMessageFn = new lambdanode.NodejsFunction(
+        this,
+        "processSNSMsgFn",
+        {
+          runtime: lambda.Runtime.NODEJS_16_X,
+          memorySize: 128,
+          timeout: cdk.Duration.seconds(3),
+          entry: `${__dirname}/../lambdas/processSNSMsg.ts`,
+        }
+      );
+
+      const processSQSMessageFn = new lambdanode.NodejsFunction(
+        this,
+        "processSQSMsgFn",
+        {
+          runtime: lambda.Runtime.NODEJS_16_X,
+          memorySize: 128,
+          timeout: cdk.Duration.seconds(3),
+          entry: `${__dirname}/../lambdas/processSQSMsg.ts`,
+        }
+      );
+
+      const processFailuresFn = new lambdanode.NodejsFunction(
+        this,
+        "processFailedMsgFn",
+        {
+          runtime: lambda.Runtime.NODEJS_16_X,
+          memorySize: 128,
+          timeout: cdk.Duration.seconds(3),
+          entry: `${__dirname}/../lambdas/processFailures.ts`,
+        }
+      );
+
       // VVV For testing
       const generateOrdersFn = new NodejsFunction(this, "GenerateOrdersFn", {
         architecture: lambda.Architecture.ARM_64,
@@ -103,6 +145,29 @@ export class EDAAppStack extends cdk.Stack {
 
     newImageTopic.addSubscription(new subs.SqsSubscription(mailerQ));
     newImageTopic.addSubscription(new subs.SqsSubscription(imageProcessQueue));
+    edaTopic.addSubscription(
+        new subs.LambdaSubscription(processSNSMessageFn, {
+            filterPolicy: {
+              user_type: sns.SubscriptionFilter.stringFilter({
+                  allowlist: ['Student','Lecturer']
+              }),
+            },
+        })
+      );
+  
+      edaTopic.addSubscription(
+        new subs.SqsSubscription(queue, {
+          rawMessageDelivery: true,
+          filterPolicy: {
+            user_type: sns.SubscriptionFilter.stringFilter({
+                denylist: ['Lecturer']  
+            }),
+            source: sns.SubscriptionFilter.stringFilter({
+              matchPrefixes: ['Moodle','Slack']  
+          }),
+          },
+        })
+      );
 
     // Event triggers
 
@@ -139,6 +204,21 @@ export class EDAAppStack extends cdk.Stack {
 
     processImageFn.addEventSource(newImageEventSource);
 
+    processSQSMessageFn.addEventSource(
+        new SqsEventSource(queue, {
+          maxBatchingWindow: Duration.seconds(5),
+          maxConcurrency: 2,
+        })
+      );
+  
+      processFailuresFn.addEventSource(
+        new SqsEventSource(failuresQueue, {
+          maxBatchingWindow: Duration.seconds(5),
+          maxConcurrency: 2,
+        })
+      );
+
+
     imagesBucket.grantRead(processImageFn);
 
     ordersQueue.grantSendMessages(generateOrdersFn)
@@ -164,6 +244,10 @@ export class EDAAppStack extends cdk.Stack {
     new CfnOutput(this, "Generator Lambda name", {
         value: generateOrdersFn.functionName,
       });
+
+      new cdk.CfnOutput(this, "topicARN", {
+        value: edaTopic.topicArn,
+      });  
 
   }
 }
